@@ -1,10 +1,10 @@
-use std::fs::File;
+use std::{fs::File, path::Path};
 
 use polars::{
     lazy::dsl::{col, concat_list},
     prelude::{
-        CsvReader, CsvWriter, DataFrame, Int64Chunked, IntoLazy, LazyCsvReader, LazyFileListReader,
-        NamedFrom, PolarsError, SerReader, SerWriter,
+        CsvWriter, DataFrame, Int64Chunked, IntoLazy, LazyCsvReader, LazyFileListReader, NamedFrom,
+        PolarsError, PolarsResult, SerWriter,
     },
     series::{IntoSeries, Series},
 };
@@ -15,105 +15,116 @@ use smartcore::{
     linalg::basic::matrix::DenseMatrix,
 };
 
-fn main() -> Result<(), PolarsError> {
-    let mut df = LazyCsvReader::new("data/train.csv")
+fn read_csv(path: impl AsRef<Path>) -> PolarsResult<DataFrame> {
+    let df = LazyCsvReader::new(path)
         .has_header(true)
         .finish()?
         .collect()?;
+    Ok(df)
+}
 
-    let df = df.apply("Sex", |s: &Series| {
-        s.utf8()
+fn write_csv(path: impl AsRef<Path>, df: &mut DataFrame) -> PolarsResult<()> {
+    let mut f = File::create(path).unwrap();
+
+    CsvWriter::new(&mut f)
+        .has_header(true)
+        .with_delimiter(b',')
+        .finish(df)?;
+    Ok(())
+}
+
+struct DataSet {
+    target: Vec<i64>,
+    data: Vec<Vec<f64>>,
+    _df: DataFrame,
+}
+
+impl DataSet {
+    fn new(df: &mut DataFrame) -> Self {
+        let df = df
+            .apply("Sex", |s: &Series| {
+                s.utf8()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .map(|s| if s == "female" { Some(1) } else { Some(0) })
+                    .collect::<Int64Chunked>()
+                    .into_series()
+            })
+            .unwrap();
+
+        let survived = df
+            .column("Survived")
+            .unwrap()
+            .i64()
             .unwrap()
             .into_no_null_iter()
-            .map(|s| if s == "female" { Some(1) } else { Some(0) })
-            .collect::<Int64Chunked>()
-            .into_series()
-    })?;
+            .collect::<Vec<i64>>();
 
-    let survived = df
-        .column("Survived")?
-        .i64()
-        .unwrap()
-        .into_no_null_iter()
-        .collect::<Vec<i64>>();
-
-    let n = [concat_list([col("Pclass"), col("Sex"), col("SibSp"), col("Parch")])?.alias("data")];
-    let df = df.clone().lazy().select(n).collect().unwrap();
-
-    let data = df
-        .column("data")?
-        .list()
-        .unwrap()
-        .into_iter()
-        .map(|n| {
-            n.unwrap()
-                .i64()
+        let n = [
+            concat_list([col("Pclass"), col("Sex"), col("SibSp"), col("Parch")])
                 .unwrap()
-                .into_no_null_iter()
-                .map(|n| n as f64)
-                .collect::<Vec<f64>>()
-        })
-        .collect::<Vec<Vec<f64>>>();
+                .alias("data"),
+        ];
+        let df = df.clone().lazy().select(n).collect().unwrap();
 
-    let matrix = DenseMatrix::from_2d_vec(&data);
+        let data = df
+            .column("data")
+            .unwrap()
+            .list()
+            .unwrap()
+            .into_no_null_iter()
+            .map(|n| {
+                n.i64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .map(|n| n as f64)
+                    .collect::<Vec<f64>>()
+            })
+            .collect::<Vec<Vec<f64>>>();
 
+        DataSet {
+            target: survived,
+            data,
+            _df: df,
+        }
+    }
+
+    fn to_matrix(&self) -> DenseMatrix<f64> {
+        DenseMatrix::from_2d_vec(&self.data)
+    }
+}
+
+fn main() -> Result<(), PolarsError> {
+    // read the traning set and create a data_set from the givven data
+    let mut df = read_csv("data/train.csv")?;
+    let data_set = DataSet::new(&mut df);
+
+    // configure the random forest and train the classifier
     let params = RandomForestClassifierParameters::default()
         .with_n_trees(500)
         .with_m(1)
         .with_max_depth(5);
-    let classifier = RandomForestClassifier::fit(&matrix, &survived, params).unwrap();
+    let classifier =
+        RandomForestClassifier::fit(&data_set.to_matrix(), &data_set.target, params).unwrap();
 
-    let mut df = LazyCsvReader::new("data/test.csv")
-        .has_header(true)
-        .finish()
-        .unwrap()
-        .collect()
-        .unwrap();
+    // read the actual data and create a data_set
+    let mut df = read_csv("data/test.csv")?;
+    let data_set = DataSet::new(&mut df);
 
-    let df = df.apply("Sex", |s: &Series| {
-        s.utf8()
-            .unwrap()
-            .into_no_null_iter()
-            .map(|s| if s == "female" { Some(1) } else { Some(0) })
-            .collect::<Int64Chunked>()
-            .into_series()
-    })?;
+    // run the prediction with the actual data
+    let result = classifier.predict(&data_set.to_matrix()).unwrap();
 
-    let n = [concat_list([col("Pclass"), col("Sex"), col("SibSp"), col("Parch")])?.alias("data")];
-    let df = df.clone().lazy().select(n).collect().unwrap();
-
-    let data = df
-        .column("data")?
-        .list()
-        .unwrap()
-        .into_no_null_iter()
-        .map(|n| {
-            n.i64()
-                .unwrap()
-                .into_no_null_iter()
-                .map(|n| n as f64)
-                .collect::<Vec<f64>>()
-        })
-        .collect::<Vec<Vec<f64>>>();
-
-    let matrix = DenseMatrix::from_2d_vec(&data);
-    let y_hat = classifier.predict(&matrix).unwrap();
-
-    let n = 892 + y_hat.len() as u32;
+    // create a new dataframe with the result
+    let n = 892 + result.len() as u32;
     let p = Series::new("PassangerId", 892..n);
-    let s = Series::new("Survived", y_hat);
+    let s = Series::new("Survived", result);
     let mut df = DataFrame::new(vec![p, s]).unwrap();
 
-    let mut f = File::create("submission.csv").unwrap();
-    CsvWriter::new(&mut f)
-        .has_header(true)
-        .with_delimiter(b',')
-        .finish(&mut df)?;
+    // write the result to a csv file
+    write_csv("submission.csv", &mut df)?;
 
-    let df_csv = CsvReader::from_path("submission.csv")
-        .unwrap()
-        .has_header(true)
-        .finish()?;
+    // load the csv and print the result
+    let df_csv = read_csv("submission.csv")?;
     println!("{}", df_csv);
     Ok(())
 }
